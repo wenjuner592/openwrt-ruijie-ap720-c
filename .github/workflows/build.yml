@@ -39,8 +39,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang flex bison gawk g++ gcc-multilib g++-multilib \
             gettext git libncurses5-dev libssl-dev python3-distutils rsync \
-            unzip zlib1g-dev wget time qemu-utils device-tree-cc \
-            python3-setuptools python3-pip libelf-dev ecj fastjar
+            unzip zlib1g-dev wget time qemu-utils device-tree-compiler \
+            python3-setuptools python3-pip libelf-dev fastjar \
           df -h /
 
       - name: Checkout OpenWrt source
