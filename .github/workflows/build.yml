@@ -1,6 +1,9 @@
 name: Build OpenWrt for Ruijie RG-AP720-C
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       openwrt_ref:
