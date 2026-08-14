@@ -119,7 +119,7 @@ jobs:
         if: github.event.inputs.build_target != 'recompile'
         run: |
           cd owrt
-          # 防止 defconfig 把以下项写回为 y
+          # 防止 defconfig 把以下项写回为 y (顶层 .config)
           sed -i 's/^CONFIG_TARGET_ROOTFS_INITRAMFS=y$/# CONFIG_TARGET_ROOTFS_INITRAMFS is not set/' .config
           sed -i 's/^CONFIG_USE_SECCOMP=y$/# CONFIG_USE_SECCOMP is not set/' .config
           sed -i 's/^CONFIG_PACKAGE_MAC80211_DEBUGFS=y$/# CONFIG_PACKAGE_MAC80211_DEBUGFS is not set/' .config
@@ -129,8 +129,67 @@ jobs:
           # 关 ZSTD 库 (vmlinux 里 ~63KB)
           sed -i 's/^CONFIG_UBIFS_FS_ZSTD=y$/# CONFIG_UBIFS_FS_ZSTD is not set/' .config
           sed -i 's/^CONFIG_CRYPTO_ZSTD=y$/# CONFIG_CRYPTO_ZSTD is not set/' .config
-          echo "=== 裁剪加固后 ==="
+          echo "=== 裁剪加固后 (顶层 .config) ==="
           grep -E 'TARGET_ROOTFS_INITRAMFS|USE_SECCOMP|PACKAGE_MAC80211_DEBUGFS|KERNEL_(XZ|LZMA)|UBIFS_FS_ZSTD|CRYPTO_ZSTD' .config | head -15
+
+      - name: Prepare 内核 .config 并裁剪 (关键: 直接操作 build_dir)
+        run: |
+          cd owrt
+          # 先跑 prepare 生成内核源码的 .config (在 build_dir/linux-6.6.X/.config)
+          echo "=== 跑 target/linux/prepare 生成内核 .config ==="
+          make target/linux/prepare V=s 2>&1 | tail -20
+          # 找到内核源码目录
+          KD=$(find build_dir/target-*/linux-ath79_nand -maxdepth 1 -name 'linux-6.6.*' -type d | head -1)
+          echo "内核源码目录: $KD"
+          if [ -z "$KD" ]; then
+            echo "ERROR: 内核源码目录未找到"
+            ls -la build_dir/target-*/linux-ath79_nand/ | head -10
+            exit 1
+          fi
+          KCFG="$KD/.config"
+          echo "内核 .config: $KCFG"
+          ls -l $KCFG
+          echo ""
+          echo "=== 内核 .config 当前 ZSTD/BPF 状态 ==="
+          grep -E 'CONFIG_(UBIFS_FS_ZSTD|CRYPTO_ZSTD|ZSTD_COMMON|ZSTD_COMPRESS|ZSTD_DECOMPRESS|BPF|VLAN_8021Q|TCP_CONG_ADVANCED|DEBUG_FS|SECCOMP|KALLSYMS|INITRAMFS)' $KCFG | head -20
+          echo ""
+          echo "=== 直接 sed 内核 .config 关闭大项 ==="
+          function disable_kconfig() {
+            local k=$1
+            if grep -q "^CONFIG_$k=y$" $KCFG; then
+              sed -i "s/^CONFIG_$k=y\$/# CONFIG_$k is not set/" $KCFG
+              echo "  关闭 $k"
+            else
+              echo "  $k 已是 not set 或不存在"
+            fi
+          }
+          # ZSTD 库 (~63KB 未压缩)
+          disable_kconfig UBIFS_FS_ZSTD
+          disable_kconfig CRYPTO_ZSTD
+          disable_kconfig ZSTD_COMMON
+          disable_kconfig ZSTD_COMPRESS
+          disable_kconfig ZSTD_DECOMPRESS
+          # BPF 解释器 (~30KB)
+          disable_kconfig BPF
+          # VLAN (AP 可选, ~40KB)
+          disable_kconfig VLAN_8021Q
+          # TCP_CONG_ADVANCED (用默认, ~10KB)
+          disable_kconfig TCP_CONG_ADVANCED
+          # 防止 olddefconfig 写回的项
+          disable_kconfig DEBUG_FS
+          disable_kconfig SECCOMP
+          disable_kconfig DEBUG_INFO
+          disable_kconfig KALLSYMS
+          disable_kconfig KALLSYMS_ALL
+          disable_kconfig INITRAMFS_SOURCE
+          # 同步 .config.prev 防止 Configure 覆盖 .config
+          if [ -f "$KD/.config.set" ]; then
+            cp $KD/.config.set $KD/.config.prev
+            echo "已同步 .config.prev (防止 Configure 覆盖)"
+          fi
+          echo ""
+          echo "=== 裁剪后内核 .config 关键项 ==="
+          grep -E 'CONFIG_(UBIFS_FS_ZSTD|CRYPTO_ZSTD|ZSTD_COMMON|BPF|VLAN_8021Q|TCP_CONG_ADVANCED|DEBUG_FS|SECCOMP)' $KCFG | head -15
 
       - name: Show config diff (NAS seed vs defconfig)
         run: |
@@ -164,11 +223,12 @@ jobs:
         run: |
           cd owrt
           echo "=== 构建内核 ==="
-          make target/linux/compile -j$(nproc) V=s 2>&1 | tail -20
+          make target/linux/compile -j$(nproc) V=s 2>&1 | tee /tmp/kernel_compile.log | tail -30
           echo "=== vmlinux 大小 ==="
           ls -lh build_dir/target-*/linux-ath79_nand/linux-*/vmlinux 2>/dev/null
-          echo "=== 打包 kernel.bin ==="
-          make target/linux/install V=s 2>&1 | tail -10
+          echo "=== 打包 kernel.bin (完整日志, 不截断) ==="
+          make target/linux/install V=s 2>&1 | tee /tmp/kernel_install.log
+          echo "=== install 完成 ==="
           echo "=== kernel.bin 大小 (Breed 限制 1,507,328 字节) ==="
           KB=$(ls build_dir/target-*/linux-ath79_nand/ruijie_rg-ap720-c-kernel.bin 2>/dev/null)
           if [ -n "$KB" ]; then
@@ -180,7 +240,10 @@ jobs:
               echo "RESULT=FAIL: 超 $((SZ - 1507328)) 字节"
             fi
           else
-            echo "ERROR: kernel.bin 未生成"
+            echo "ERROR: kernel.bin 未生成, install 日志关键行:"
+            grep -iE 'error|too big|fail|warning.*mkimage|cannot' /tmp/kernel_install.log | head -30
+            echo "=== install 日志最后 50 行 ==="
+            tail -50 /tmp/kernel_install.log
           fi
 
       - name: Build packages
