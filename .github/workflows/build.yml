@@ -1,0 +1,207 @@
+name: Build OpenWrt for Ruijie RG-AP720-C
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_ref:
+        description: 'OpenWrt 源码分支/tag (默认 openwrt-24.10)'
+        required: false
+        default: 'openwrt-24.10'
+      build_target:
+        description: '构建目标 (defconfig=用 seed.config 重建 / recompile=只重编译)'
+        required: false
+        default: 'defconfig'
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout this repo (patches + config)
+        uses: actions/checkout@v4
+        with:
+          path: 'workspace'
+
+      - name: Free disk space
+        run: |
+          echo "=== 清理 GH runner 默认占用 ==="
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo apt-get clean
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison gawk g++ gcc-multilib g++-multilib \
+            gettext git libncurses5-dev libssl-dev python3-distutils rsync \
+            unzip zlib1g-dev wget time qemu-utils device-tree-cc \
+            python3-setuptools python3-pip libelf-dev ecj fastjar
+          df -h /
+
+      - name: Checkout OpenWrt source
+        run: |
+          git clone --depth 1 --branch ${{ github.event.inputs.openwrt_ref || 'openwrt-24.10' }} \
+            https://github.com/openwrt/openwrt.git owrt
+          cd owrt
+          echo "OpenWrt 版本: $(git rev-parse --short HEAD) $(git describe --tags 2>/dev/null)"
+          echo "kernel-6.6 版本: $(cat include/kernel-6.6 2>/dev/null | head -1)"
+
+      - name: Apply Ruijie device files (DTS, nand.mk, base-files)
+        run: |
+          cd owrt
+          # 设备 DTS
+          cp -v ../workspace/files/qca9563_ruijie_rg-ap720-c.dts \
+                target/linux/ath79/dts/
+          # nand.mk (含 Device/ruijie_rg-ap720-c 定义)
+          cp -v ../workspace/files/nand.mk target/linux/ath79/image/
+          # base-files: 02_network, 01_leds, 10-ath9k-eeprom (路径: nand/base-files/)
+          cp -v ../workspace/files/02_network \
+                target/linux/ath79/nand/base-files/etc/board.d/
+          cp -v ../workspace/files/01_leds \
+                target/linux/ath79/nand/base-files/etc/board.d/
+          cp -v ../workspace/files/10-ath9k-eeprom \
+                target/linux/ath79/nand/base-files/etc/hotplug.d/firmware/
+          # 内核配置模板 (已裁剪 ZSTD/LZO/DEBUG_FS 等)
+          cp -v ../workspace/files/generic-config-6.6 target/linux/generic/config-6.6
+          cp -v ../workspace/files/ath79-config-6.6 target/linux/ath79/config-6.6
+          echo "=== 应用补丁完成 ==="
+
+      - name: Copy seed .config (NAS 已裁剪版本)
+        run: |
+          cp -v workspace/seed.config owrt/.config
+          cd owrt
+          echo "=== seed.config 关键项 ==="
+          grep -E 'TARGET_ROOTFS_INITRAMFS|USE_SECCOMP|PACKAGE_MAC80211_DEBUGFS|TARGET_ath79_nand_DEVICE_ruijie' .config | head -10
+
+      - name: Update feeds
+        run: |
+          cd owrt
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: make defconfig (从 seed.config 规整化)
+        if: github.event.inputs.build_target != 'recompile'
+        run: |
+          cd owrt
+          make defconfig
+          echo "=== defconfig 后关键项 ==="
+          grep -E 'TARGET_ROOTFS_INITRAMFS|USE_SECCOMP|PACKAGE_MAC80211_DEBUGFS|TARGET_ath79_nand_DEVICE_ruijie|KERNEL_CC_OPTIMIZE_FOR_SIZE' .config | head -10
+
+      - name: Post-defconfig 裁剪加固 (防止 defconfig 写回)
+        if: github.event.inputs.build_target != 'recompile'
+        run: |
+          cd owrt
+          # 防止 defconfig 把以下项写回为 y
+          sed -i 's/^CONFIG_TARGET_ROOTFS_INITRAMFS=y$/# CONFIG_TARGET_ROOTFS_INITRAMFS is not set/' .config
+          sed -i 's/^CONFIG_USE_SECCOMP=y$/# CONFIG_USE_SECCOMP is not set/' .config
+          sed -i 's/^CONFIG_PACKAGE_MAC80211_DEBUGFS=y$/# CONFIG_PACKAGE_MAC80211_DEBUGFS is not set/' .config
+          # 内核压缩格式: 强制 lzma (Breed 兼容)
+          sed -i 's/^CONFIG_KERNEL_XZ=y$/# CONFIG_KERNEL_XZ is not set/' .config
+          sed -i 's/^# CONFIG_KERNEL_LZMA is not set$/CONFIG_KERNEL_LZMA=y/' .config
+          # 关 ZSTD 库 (vmlinux 里 ~63KB)
+          sed -i 's/^CONFIG_UBIFS_FS_ZSTD=y$/# CONFIG_UBIFS_FS_ZSTD is not set/' .config
+          sed -i 's/^CONFIG_CRYPTO_ZSTD=y$/# CONFIG_CRYPTO_ZSTD is not set/' .config
+          echo "=== 裁剪加固后 ==="
+          grep -E 'TARGET_ROOTFS_INITRAMFS|USE_SECCOMP|PACKAGE_MAC80211_DEBUGFS|KERNEL_(XZ|LZMA)|UBIFS_FS_ZSTD|CRYPTO_ZSTD' .config | head -15
+
+      - name: Show config diff (NAS seed vs defconfig)
+        run: |
+          cd owrt
+          echo "=== 与 NAS seed.config 的差异 (关键项) ==="
+          diff <(grep -E '^(CONFIG|#) (TARGET_ROOTFS_INITRAMFS|USE_SECCOMP|PACKAGE_MAC80211_DEBUGFS|KERNEL_CC_OPTIMIZE_FOR_SIZE|KERNEL_LZMA|KERNEL_XZ|UBIFS_FS_ZSTD|CRYPTO_ZSTD|TARGET_ath79_nand_DEVICE_ruijie)' ../workspace/seed.config | sort) \
+               <(grep -E '^(CONFIG|#) (TARGET_ROOTFS_INITRAMFS|USE_SECCOMP|PACKAGE_MAC80211_DEBUGFS|KERNEL_CC_OPTIMIZE_FOR_SIZE|KERNEL_LZMA|KERNEL_XZ|UBIFS_FS_ZSTD|CRYPTO_ZSTD|TARGET_ath79_nand_DEVICE_ruijie)' .config | sort) || true
+
+      - name: Download sources (DL phase)
+        run: |
+          cd owrt
+          make download -j$(nproc) V=s 2>&1 | tail -20
+
+      - name: Build tools
+        run: |
+          cd owrt
+          make tools/install -j$(nproc) V=s 2>&1 | tail -10
+
+      - name: Build toolchain
+        run: |
+          cd owrt
+          make toolchain/install -j$(nproc) V=s 2>&1 | tail -10
+
+      - name: Build target/linux (含内核)
+        run: |
+          cd owrt
+          echo "=== 构建内核 ==="
+          make target/linux/compile -j$(nproc) V=s 2>&1 | tail -20
+          echo "=== vmlinux 大小 ==="
+          ls -lh build_dir/target-*/linux-ath79_nand/linux-*/vmlinux 2>/dev/null
+          echo "=== 打包 kernel.bin ==="
+          make target/linux/install V=s 2>&1 | tail -10
+          echo "=== kernel.bin 大小 (Breed 限制 1,507,328 字节) ==="
+          KB=$(ls build_dir/target-*/linux-ath79_nand/ruijie_rg-ap720-c-kernel.bin 2>/dev/null)
+          if [ -n "$KB" ]; then
+            SZ=$(stat -c %s "$KB")
+            echo "kernel.bin: $SZ 字节"
+            if [ "$SZ" -le 1507328 ]; then
+              echo "RESULT=PASS: kernel.bin 在 Breed 限制内!"
+            else
+              echo "RESULT=FAIL: 超 $((SZ - 1507328)) 字节"
+            fi
+          else
+            echo "ERROR: kernel.bin 未生成"
+          fi
+
+      - name: Build packages
+        run: |
+          cd owrt
+          make package/compile -j$(nproc) V=s 2>&1 | tail -20 || true
+
+      - name: Build images (sysupgrade / factory)
+        run: |
+          cd owrt
+          make package/install -j$(nproc) V=s 2>&1 | tail -10
+          make package/index V=s 2>&1 | tail -5
+          make target/linux/install -j1 V=s 2>&1 | tail -10
+          echo "=== 最终镜像产物 ==="
+          ls -lh bin/targets/ath79/nand/ 2>/dev/null | grep -iE 'ruijie|sysupgrade|factory' || echo "(无 ruijie 产物)"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-ath79-nand-ruijie-rg-ap720-c
+          path: |
+            owrt/bin/targets/ath79/nand/*ruijie*
+            owrt/bin/targets/ath79/nand/sha256sums
+            owrt/build_dir/target-*/linux-ath79_nand/ruijie_rg-ap720-c-kernel.bin
+            owrt/build_dir/target-*/linux-ath79_nand/linux-*/vmlinux
+            owrt/.config
+            owrt/.config.diff
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Report kernel size
+        if: always()
+        run: |
+          echo "## 构建报告" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          KB=$(find owrt/build_dir -name 'ruijie_rg-ap720-c-kernel.bin' 2>/dev/null | head -1)
+          if [ -n "$KB" ]; then
+            SZ=$(stat -c %s "$KB")
+            echo "**kernel.bin**: $SZ 字节" >> $GITHUB_STEP_SUMMARY
+            echo "**Breed 限制**: 1,507,328 字节 (1472k)" >> $GITHUB_STEP_SUMMARY
+            if [ "$SZ" -le 1507328 ]; then
+              echo "**状态**: PASS ✅" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "**状态**: FAIL ❌ (超 $((SZ - 1507328)) 字节)" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "**kernel.bin**: 未生成 ❌" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 镜像产物" >> $GITHUB_STEP_SUMMARY
+          ls -lh owrt/bin/targets/ath79/nand/*ruijie* 2>/dev/null >> $GITHUB_STEP_SUMMARY || echo "(无)" >> $GITHUB_STEP_SUMMARY
