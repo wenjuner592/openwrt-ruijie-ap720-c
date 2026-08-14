@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+//
+// Ruijie RG-AP720-C  (also sold as iKuai W7 / IK-W7)
+//
+// SoC:   Qualcomm QCA9563 (2.4GHz ath9k built-in)
+// 5GHz:  Qualcomm QCA9888 (ath10k on PCIe)
+// Switch: Qualcomm QCA8337 (single 1000M PoE LAN port, SGMII to CPU)
+// Flash: 16MB SPI-NAND, bootloader: Breed
+//
+// Flash layout (Breed):
+//   u-boot      0x000000-0x040000 (256k)
+//   u-boot-env  0x040000-0x050000 (64k)
+//   art         0x050000-0x060000 (64k)
+//   kernel      0x060000-0x1d0000 (1472k)
+//   rootfs/ubi  0x1d0000-0xff0000 (14464k)
+//   ikdbg       0xff0000-0x1000000 (64k)
+
+#include "qca956x.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "Ruijie RG-AP720-C";
+	compatible = "ruijie,rg-ap720-c", "qca,qca9563";
+
+	aliases {
+		label-mac-device = &eth0;
+		led-boot = &led_blue;
+		led-failsafe = &led_blue;
+		led-running = &led_blue;
+		led-upgrade = &led_blue;
+	};
+
+	chosen {
+		bootargs = "console=ttyS0,115200 root=ubi0:rootfs ubi.mtd=ubi";
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&jtag_disable_pins>;
+
+		led_green: green {
+			label = "green:status";
+			gpios = <&gpio 1 GPIO_ACTIVE_LOW>;
+		};
+
+		led_blue: blue {
+			label = "blue:status";
+			gpios = <&gpio 7 GPIO_ACTIVE_LOW>;
+			default-state = "keep";
+		};
+
+		led_yellow: yellow {
+			label = "yellow:status";
+			gpios = <&gpio 8 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&jtag_disable_pins>;
+
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio 17 GPIO_ACTIVE_LOW>;
+			debounce-interval = <60>;
+		};
+	};
+};
+
+&mdio0 {
+	status = "okay";
+
+	phy0: ethernet-phy@0 {
+		reg = <0>;
+		phy-mode = "sgmii";
+		qca,ar8327-initvals = <
+			0x04 0x00080080 /* PORT0 PAD MODE CTRL */
+			0x7c 0x0000007e /* PORT0_STATUS */
+		>;
+	};
+};
+
+&eth0 {
+	status = "okay";
+	phy-handle = <&phy0>;
+
+	nvmem-cells = <&macaddr_art_0 0>;
+	nvmem-cell-names = "mac-address";
+};
+
+&wmac {
+	status = "okay";
+
+	nvmem-cells = <&macaddr_art_0 1>;
+	nvmem-cell-names = "mac-address";
+};
+
+&pcie {
+	status = "okay";
+
+	wifi@0,0 {
+		compatible = "qcom,ath10k";
+		reg = <0x0000 0 0 0 0>;
+		nvmem-cells = <&macaddr_art_0 2>;
+		nvmem-cell-names = "mac-address";
+	};
+};
+
+&spi {
+	status = "okay";
+
+	flash@0 {
+		compatible = "spi-nand";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "u-boot";
+				reg = <0x0 0x40000>;
+				read-only;
+			};
+
+			partition@40000 {
+				label = "u-boot-env";
+				reg = <0x40000 0x10000>;
+				read-only;
+			};
+
+			partition@50000 {
+				label = "art";
+				reg = <0x50000 0x10000>;
+				read-only;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					macaddr_art_0: macaddr@0 {
+						compatible = "mac-base";
+						reg = <0x0 0x6>;
+						#nvmem-cell-cells = <1>;
+					};
+				};
+			};
+
+			partition@60000 {
+				label = "kernel";
+				reg = <0x60000 0x170000>;
+			};
+
+			partition@1d0000 {
+				label = "ubi";
+				reg = <0x1d0000 0xe20000>;
+			};
+
+			partition@ff0000 {
+				label = "ikdbg";
+				reg = <0xff0000 0x10000>;
+				read-only;
+			};
+		};
+	};
+};
+
+[exit=0]
