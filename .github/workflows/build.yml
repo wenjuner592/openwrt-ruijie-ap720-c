@@ -41,15 +41,31 @@ jobs:
             gettext git libncurses5-dev libssl-dev python3-distutils rsync \
             unzip zlib1g-dev wget time qemu-utils device-tree-compiler \
             python3-setuptools python3-pip libelf-dev fastjar \
+            python3 python3-doc python3-tk libpython3-dev
+          # 兼容性: python2 链接 (部分 OpenWrt 脚本仍需)
+          sudo ln -sf /usr/bin/python3 /usr/bin/python || true
           df -h /
 
       - name: Checkout OpenWrt source
         run: |
-          git clone --depth 1 --branch ${{ github.event.inputs.openwrt_ref || 'openwrt-24.10' }} \
-            https://github.com/openwrt/openwrt.git owrt
+          REF="${{ github.event.inputs.openwrt_ref || 'openwrt-24.10' }}"
+          echo "=== Cloning openwrt/openwrt@$REF ==="
+          git clone --depth 1 --branch "$REF" https://github.com/openwrt/openwrt.git owrt
           cd owrt
           echo "OpenWrt 版本: $(git rev-parse --short HEAD) $(git describe --tags 2>/dev/null)"
-          echo "kernel-6.6 版本: $(cat include/kernel-6.6 2>/dev/null | head -1)"
+          echo "kernel 版本文件:"
+          ls include/kernel-* 2>/dev/null
+          cat include/kernel-6.6 2>/dev/null | head -3
+
+      - name: Verify OpenWrt source structure
+        run: |
+          cd owrt
+          echo "=== 关键目录检查 ==="
+          ls -d target/linux/ath79 target/linux/generic target/linux/ath79/nand target/linux/ath79/dts 2>&1
+          echo "--- ath79 nand base-files 是否存在 ---"
+          ls target/linux/ath79/nand/base-files/etc/board.d/ 2>&1
+          echo "--- ath79 image 目录 ---"
+          ls target/linux/ath79/image/*.mk 2>&1
 
       - name: Apply Ruijie device files (DTS, nand.mk, base-files)
         run: |
@@ -89,7 +105,13 @@ jobs:
         if: github.event.inputs.build_target != 'recompile'
         run: |
           cd owrt
-          make defconfig
+          # defconfig 会对 seed.config 做规整化 (移除不存在的选项, 补全默认)
+          make defconfig 2>&1 | tee /tmp/defconfig.log
+          echo "=== defconfig 退出码: $? ==="
+          # 检查是否有关键错误
+          if grep -iE 'error|warning.*not found' /tmp/defconfig.log; then
+            echo "WARNING: defconfig 出现错误信息"
+          fi
           echo "=== defconfig 后关键项 ==="
           grep -E 'TARGET_ROOTFS_INITRAMFS|USE_SECCOMP|PACKAGE_MAC80211_DEBUGFS|TARGET_ath79_nand_DEVICE_ruijie|KERNEL_CC_OPTIMIZE_FOR_SIZE' .config | head -10
 
@@ -120,7 +142,13 @@ jobs:
       - name: Download sources (DL phase)
         run: |
           cd owrt
-          make download -j$(nproc) V=s 2>&1 | tail -20
+          # 用单线程避免 GitHub API 限速, 失败时显示完整日志
+          make download -j1 V=s 2>&1 | tee /tmp/download.log | tail -50
+          # 检查下载失败
+          if grep -E 'ERROR|failed to download|hash mismatch' /tmp/download.log; then
+            echo "ERROR: 下载阶段失败"
+            exit 1
+          fi
 
       - name: Build tools
         run: |
