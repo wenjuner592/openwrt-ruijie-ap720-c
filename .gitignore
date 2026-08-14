@@ -1,0 +1,5 @@
+*.log
+*.bak
+*.orig
+*.rej
+__pycache__/
